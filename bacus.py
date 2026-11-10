@@ -6,8 +6,9 @@ BACUS BANDUNG - toko online, member, dan back office dalam satu file.
 Isi:
   * Toko: katalog per kategori (Beer, Anggur, Wine, Whisky, Vodka, Tradisional,
     Lain-lain), keranjang, kode promo, hitung jarak dari link Google Maps,
-    free ongkir radius 10 km dengan minimal belanja, checkout yang menyimpan
-    pesanan + foto rumah lalu membuka WhatsApp toko dengan pesan terisi.
+    validasi lokasi rumah dari link Maps, free ongkir radius 10 km dengan minimal
+    belanja, checkout wajib mengisi data pengantaran + foto rumah, lalu membuka
+    WhatsApp toko dengan pesan order terisi.
   * Member: daftar dengan foto KTP/SIM + foto rumah + PIN, biaya daftar sekali
     (seumur hidup), diskon otomatis, alamat tersimpan, masuk pakai nomor WA + PIN.
   * Back office (/admin): pesanan dan statusnya, harga produk, harga promo,
@@ -15,7 +16,7 @@ Isi:
     toko (WhatsApp, rekening, titik toko, radius, minimal free ongkir).
 
 CARA MENJALANKAN (lokal)
-  1. Pasang Python 3.9+ lalu:  pip install flask pillow
+  1. Pasang Python 3.9+ lalu:  pip install -r requirements.txt
      (pillow tidak wajib, tapi disarankan: foto diperkecil dan data lokasi
       GPS di dalam foto dihapus sebelum disimpan)
   2. Jalankan:  python bacus.py
@@ -27,16 +28,30 @@ PENGATURAN LEWAT ENVIRONMENT VARIABLE (opsional)
   BACUS_DATA            folder data (database + foto). Default: ./bacus_data
   BACUS_ADMIN_USER      username admin pertama. Default: admin
   BACUS_ADMIN_PASSWORD  password admin pertama. Default: dibuat acak
+  BACUS_ADMIN_WA        nomor WhatsApp tujuan notifikasi admin. Default: 08974109148
   BACUS_SECRET_KEY      kunci sesi. Default: dibuat acak dan disimpan di folder data
   BACUS_HTTPS=1         wajib diisi saat sudah memakai HTTPS (cookie aman)
   PORT                  port server. Default: 8000
 
-MENJALANKAN DI SERVER (produksi)
-  pip install flask pillow gunicorn
-  BACUS_HTTPS=1 gunicorn -w 2 -b 127.0.0.1:8000 bacus:app
-  Taruh di belakang Nginx/Caddy dengan HTTPS. Website ini menyimpan foto KTP,
-  jadi JANGAN dibuka ke publik tanpa HTTPS. Folder BACUS_DATA berisi database
-  dan foto: jangan dijadikan folder publik, dan buat backup rutin.
+MENJALANKAN DI RAILWAY
+  Railway memakai Procfile dan PORT secara otomatis. Pasang persistent volume
+  di /data, lalu set BACUS_DATA=/data, BACUS_HTTPS=1, dan BACUS_SECRET_KEY
+  sebagai variables/secrets di Railway. Set BACUS_ADMIN_WA=08974109148 untuk
+  memilih nomor penerima notifikasi order; variable ini mengesampingkan nomor
+  pada menu Pengaturan. Set BACUS_ADMIN_PASSWORD untuk membuat password admin
+  pertama yang diketahui; bila tidak diatur, password acak hanya tercetak di logs.
+  Website ini menyimpan foto KTP: pastikan HTTPS aktif dan batasi akses log.
+  Folder BACUS_DATA berisi database dan foto; buat backup rutin.
+  Titik awal toko: -6.902017, 107.652076 (Bacus Bandung, dari link Maps yang diberikan).
+  Jarak rumah dihitung garis lurus. Order di luar radius tetap masuk dengan ongkir
+  menunggu konfirmasi admin. Pelanggan harus menekan Kirim di WhatsApp; pengiriman
+  pesan otomatis memerlukan integrasi WhatsApp Business Cloud API.
+
+MENJALANKAN DI SERVER LAIN (produksi)
+  pip install -r requirements.txt
+  BACUS_HTTPS=1 gunicorn --workers 1 --bind 0.0.0.0:$PORT bacus:app
+  Atur PORT dan gunakan persistent storage untuk BACUS_DATA. Website ini
+  menyimpan foto KTP, jadi JANGAN dibuka ke publik tanpa HTTPS.
 """
 
 import io
@@ -84,8 +99,10 @@ ORDER_STATUS_D = dict(ORDER_STATUS)
 MEMBER_STATUS = {"pending": "Menunggu verifikasi", "aktif": "Aktif",
                  "ditolak": "Ditolak", "dicabut": "Dicabut"}
 
+DEFAULT_ADMIN_WA = "08974109148"
+
 DEFAULT_SETTINGS = {
-    "wa": "628974109148",
+    "wa": DEFAULT_ADMIN_WA,
     "store_lat": -6.902017, "store_lng": 107.652076,
     "radius_km": 10, "free_min": 100000,
     "bank_name": "BCA", "bank_no": "000 000 0000", "bank_holder": "Bacus Bandung",
@@ -125,7 +142,8 @@ CREATE TABLE IF NOT EXISTS admins(
 CREATE TABLE IF NOT EXISTS products(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, volume TEXT DEFAULT '', abv REAL DEFAULT 0,
   style TEXT DEFAULT '', cat TEXT DEFAULT 'beer', price INTEGER NOT NULL,
-  promo_price INTEGER DEFAULT 0, label TEXT DEFAULT 'a', active INTEGER DEFAULT 1,
+  promo_price INTEGER DEFAULT 0, label TEXT DEFAULT 'a', image_file TEXT DEFAULT '',
+  active INTEGER DEFAULT 1,
   sort INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS promos(
   id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, kind TEXT DEFAULT 'rp',
@@ -138,7 +156,8 @@ CREATE TABLE IF NOT EXISTS members(
 CREATE TABLE IF NOT EXISTS orders(
   id INTEGER PRIMARY KEY, order_no TEXT UNIQUE NOT NULL, token TEXT NOT NULL,
   created_at TEXT, member_id INTEGER, name TEXT, wa TEXT, address TEXT, landmark TEXT,
-  map_url TEXT, distance_km REAL, house_file TEXT, items_json TEXT, subtotal INTEGER,
+  map_url TEXT, distance_km REAL, map_status TEXT DEFAULT 'unknown',
+  delivery_radius_km REAL DEFAULT 10, house_file TEXT, items_json TEXT, subtotal INTEGER,
   member_disc INTEGER, promo_code TEXT, promo_disc INTEGER, free_ship INTEGER,
   total INTEGER, status TEXT DEFAULT 'baru', note TEXT DEFAULT '');
 """
@@ -194,8 +213,25 @@ def now_str():
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    product_columns = {row[1] for row in conn.execute("PRAGMA table_info(products)")}
+    if "image_file" not in product_columns:
+        conn.execute("ALTER TABLE products ADD COLUMN image_file TEXT DEFAULT ''")
+    order_columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "map_status" not in order_columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN map_status TEXT DEFAULT 'unknown'")
+    if "delivery_radius_km" not in order_columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN delivery_radius_km REAL DEFAULT 10")
     for k, v in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(k, v) VALUES(?, ?)", (k, json.dumps(v)))
+    stored_wa = conn.execute("SELECT v FROM settings WHERE k='wa'").fetchone()
+    if stored_wa and json.loads(stored_wa[0]) == "628974109148":
+        conn.execute("UPDATE settings SET v=? WHERE k='wa'", (json.dumps(DEFAULT_SETTINGS["wa"]),))
+    env_admin_wa = os.environ.get("BACUS_ADMIN_WA")
+    if env_admin_wa:
+        normalized_admin_wa = norm_wa(env_admin_wa)
+        if not re.fullmatch(r"62\d{9,13}", normalized_admin_wa):
+            conn.close()
+            raise ValueError("BACUS_ADMIN_WA tidak valid. Gunakan nomor WhatsApp aktif, misalnya 08974109148.")
     if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
         for i, p in enumerate(SEED_PRODUCTS):
             conn.execute("INSERT INTO products(name, volume, abv, style, cat, price, promo_price, label, sort)"
@@ -246,6 +282,14 @@ def norm_wa(s):
 
 def wa_link(number, text):
     return "https://wa.me/" + norm_wa(number) + "?text=" + urllib.parse.quote(text)
+
+
+def admin_whatsapp():
+    """Nomor tujuan notifikasi admin, dengan environment sebagai override Railway."""
+    return norm_wa(os.environ.get("BACUS_ADMIN_WA") or S()["wa"])
+
+
+app.jinja_env.globals["admin_whatsapp"] = admin_whatsapp
 
 
 def to_int(v, default=0):
@@ -310,7 +354,7 @@ _fails = {}
 
 def blocked(key):
     now = time.time()
-    _fails[key] = [t for t in _fails.get(key, []) if now - t < 600]
+    _fails[key] = [t for t in _fails.get(key, []) if now - t < 6]
     return len(_fails[key]) >= 5
 
 
@@ -525,7 +569,7 @@ def compute(items, code, map_url, member):
     map_msg = {
         "none": "",
         "invalid": "Ini bukan link Google Maps. Tempel link dari tombol Bagikan di Google Maps.",
-        "unknown": "Link diterima, tapi titiknya belum terbaca. Admin akan mengecek jarak dan ongkir.",
+        "unknown": "Titik rumah belum terbaca. Bagikan pin lokasi rumah dari Google Maps, lalu coba lagi.",
         "in": "Sekitar %s km dari toko, masuk radius free ongkir%s." % (
             km_txt, (" untuk belanja minimal " + rp(free_min)) if free_min else ""),
         "out": "Sekitar %s km dari toko, di luar radius free ongkir %s km. Admin akan mengonfirmasi ongkir." % (
@@ -540,13 +584,14 @@ def compute(items, code, map_url, member):
 
 
 def ship_text(c):
+    radius = c.get("radius_km", S()["radius_km"])
     km_txt = ("%.1f" % c["dist"]).replace(".", ",") if c.get("dist") is not None else ""
     if c["free"]:
         return "GRATIS (sekitar %s km)" % km_txt
     if c["map_status"] == "in":
         return "dicek admin (sekitar %s km, belanja di bawah minimal free ongkir %s)" % (km_txt, rp(S()["free_min"]))
     if c["map_status"] == "out":
-        return "dicek admin (sekitar %s km, di luar radius %s km)" % (km_txt, S()["radius_km"])
+        return "dicek admin (sekitar %s km, di luar radius %s km)" % (km_txt, _num(float(radius)))
     return "dicek admin (jarak belum terhitung)"
 
 
@@ -589,21 +634,22 @@ def checkout():
         errors.append("Isi nomor WhatsApp yang aktif.")
     if len(address) < 15:
         errors.append("Isi alamat lengkap.")
+    if len(landmark) < 2:
+        errors.append("Isi patokan lokasi rumah.")
     if c["map_status"] in ("none", "invalid"):
         errors.append("Tempel link Google Maps titik rumahmu.")
-    if not f.get("umur"):
+    elif c["map_status"] == "unknown":
+        errors.append("Titik rumah belum bisa dibaca dari link Google Maps. Bagikan pin lokasi rumah yang tepat lalu coba lagi.")
+    if f.get("umur") != "1":
         errors.append("Centang pernyataan usia 21 tahun ke atas.")
-    house = None
-    if not errors:
-        house, err = save_photo(request.files.get("foto"), "rumah")
-        if err == "missing":
-            if not g.member:
-                errors.append("Unggah foto tampak depan rumah.")
-        elif err:
-            errors.append(err)
     if errors:
-        for e in errors:
-            flash(e, "bad")
+        for error in errors:
+            flash(error, "bad")
+        return redirect(url_for("shop") + "#checkout")
+    house = None
+    house, err = save_photo(request.files.get("foto"), "rumah")
+    if err:
+        flash("Unggah foto tampak depan rumah." if err == "missing" else err, "bad")
         return redirect(url_for("shop") + "#checkout")
     for _ in range(5):
         order_no = "BCS-%s-%04d" % (datetime.now().strftime("%y%m%d"), secrets.randbelow(10000))
@@ -612,11 +658,11 @@ def checkout():
     token = secrets.token_urlsafe(16)
     db().execute(
         "INSERT INTO orders(order_no, token, created_at, member_id, name, wa, address, landmark, map_url,"
-        " distance_km, house_file, items_json, subtotal, member_disc, promo_code, promo_disc, free_ship, total)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " distance_km, map_status, delivery_radius_km, house_file, items_json, subtotal, member_disc, promo_code,"
+        " promo_disc, free_ship, total) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (order_no, token, now_str(), g.member["id"] if g.member else None, name, wa, address, landmark, map_url,
-         c["dist"], house, json.dumps(c["lines"]), c["sub"], c["member_disc"], c["promo_code"],
-         c["promo_disc"], 1 if c["free"] else 0, c["total"]))
+         c["dist"], c["map_status"], S()["radius_km"], house, json.dumps(c["lines"]), c["sub"], c["member_disc"],
+         c["promo_code"], c["promo_disc"], 1 if c["free"] else 0, c["total"]))
     db().commit()
     return redirect(url_for("order_page", order_no=order_no, k=token))
 
@@ -627,11 +673,22 @@ def order_message(o, lines):
     if o["member_id"]:
         m = db().execute("SELECT member_no FROM members WHERE id=?", (o["member_id"],)).fetchone()
         member_no = m["member_no"] if m else None
-    c = {"free": bool(o["free_ship"]), "dist": o["distance_km"],
-         "map_status": ("in" if o["distance_km"] is not None and o["distance_km"] <= float(s["radius_km"])
-                        else "out" if o["distance_km"] is not None else "unknown")}
-    out = ["*ORDER BACUS BANDUNG*", "No. order: " + o["order_no"],
+    map_status = o["map_status"] or "unknown"
+    radius = o["delivery_radius_km"] if o["delivery_radius_km"] is not None else float(s["radius_km"])
+    if map_status == "unknown" and o["distance_km"] is not None:
+        map_status = "in" if o["distance_km"] <= float(radius) else "out"
+    c = {"free": bool(o["free_ship"]), "dist": o["distance_km"], "map_status": map_status,
+         "radius_km": radius}
+    out = ["*PESANAN BARU - BACUS BANDUNG*", "No. order: " + o["order_no"],
+           "Waktu: " + o["created_at"],
            ("Member: %s" % member_no) if member_no else "Member: bukan member", "", "*Pesanan*"]
+    if c["dist"] is not None:
+        out += ["*Lokasi:* %s km garis lurus dari toko (radius %s km)." % (
+            ("%.2f" % c["dist"]).replace(".", ","), _num(float(radius)))]
+    if c["map_status"] == "out":
+        out.append("*DI LUAR RADIUS* - ongkir perlu konfirmasi admin sebelum pembayaran.")
+    elif c["map_status"] == "in":
+        out.append("Lokasi masuk radius toko.")
     out += ["• %dx %s (%s) = %s" % (l["qty"], l["name"], l["volume"], rp(l["total"])) for l in lines]
     out.append("Subtotal: " + rp(o["subtotal"]))
     if o["member_disc"]:
@@ -641,11 +698,10 @@ def order_message(o, lines):
     out.append("Ongkir: " + ship_text(c))
     out.append(("*Total transfer: %s*" % rp(o["total"])) if o["free_ship"]
                else "*Total: %s + ongkir (menunggu konfirmasi admin)*" % rp(o["total"]))
-    out += ["", "*Pengantaran*", "Nama: " + o["name"], "WhatsApp: " + o["wa"], "Alamat: " + o["address"]]
-    if o["landmark"]:
-        out.append("Patokan: " + o["landmark"])
-    out += ["Link peta: " + o["map_url"], "",
-            "Foto rumah sudah saya unggah di website." if o["house_file"] else "Foto rumah sudah tersimpan di data member.",
+    out += ["", "*Pengantaran*", "Nama: " + o["name"], "WhatsApp: " + o["wa"],
+            "Alamat: " + o["address"], "Patokan: " + o["landmark"]]
+    out += ["Pin rumah: " + o["map_url"], "Titik toko: https://maps.app.goo.gl/mWTbxSwqTx8SJH3LA", "",
+            "Foto rumah sudah diunggah dan tersimpan untuk dilihat admin.",
             "Pembayaran: transfer bank. Bukti transfer saya kirim di chat ini.",
             "Saya berusia 21 tahun ke atas."]
     return "\n".join(out)
@@ -656,8 +712,15 @@ def order_page(order_no):
     o = db().execute("SELECT * FROM orders WHERE order_no=?", (order_no,)).fetchone()
     if not o or not secrets.compare_digest(request.args.get("k", ""), o["token"]):
         abort(404)
+    delivery_status = o["map_status"] or "unknown"
+    if delivery_status == "unknown" and o["distance_km"] is not None:
+        radius = o["delivery_radius_km"]
+        if radius is None:
+            radius = float(S()["radius_km"])
+        delivery_status = "in" if o["distance_km"] <= float(radius) else "out"
     lines = json.loads(o["items_json"] or "[]")
-    return render_template("order.html", o=o, lines=lines, wa=wa_link(S()["wa"], order_message(o, lines)))
+    return render_template("order.html", o=o, lines=lines, delivery_status=delivery_status,
+                           wa=wa_link(admin_whatsapp(), order_message(o, lines)))
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +749,7 @@ def member_login():
     wa, pin = norm_wa(request.form.get("wa")), request.form.get("pin", "")
     key = "m:" + (request.remote_addr or "") + wa
     if blocked(key):
-        flash("Terlalu banyak percobaan. Coba lagi 10 menit lagi.", "bad")
+        flash("Terlalu banyak percobaan. Coba lagi setelah 6 detik.", "bad")
         return redirect(url_for("member_home"))
     m = db().execute("SELECT * FROM members WHERE wa=?", (wa,)).fetchone()
     if not m or not check_password_hash(m["pin_hash"], pin):
@@ -731,7 +794,7 @@ def member_register():
         errors.append("PIN harus 6 angka.")
     elif pin != pin2:
         errors.append("Ulangi PIN dengan angka yang sama.")
-    if not f.get("umur"):
+    if f.get("umur") != "1":
         errors.append("Centang pernyataan usia 21 tahun ke atas.")
     if not f.get("setuju"):
         errors.append("Centang persetujuan penyimpanan foto KTP/SIM.")
@@ -770,7 +833,7 @@ def member_register():
                      "WhatsApp: " + wa, "",
                      "Foto KTP/SIM dan foto rumah sudah saya unggah di website.",
                      "Biaya member seumur hidup %s sudah/akan saya transfer. Bukti transfer saya kirim di chat ini." % rp(s["member_fee"])])
-    return render_template("member_registered.html", mid=mid, wa=wa_link(s["wa"], msg))
+    return render_template("member_registered.html", mid=mid, wa=wa_link(admin_whatsapp(), msg))
 
 
 # ---------------------------------------------------------------------------
@@ -780,17 +843,13 @@ def member_register():
 def admin_login():
     if request.method == "POST":
         user, pw = request.form.get("username", "").strip(), request.form.get("password", "")
-        key = "a:" + (request.remote_addr or "")
-        if blocked(key):
-            flash("Terlalu banyak percobaan. Coba lagi 10 menit lagi.", "bad")
+        a = db().execute("SELECT * FROM admins WHERE username=?", (user,)).fetchone()
+        if a and check_password_hash(a["pw_hash"], pw):
+            session.clear()
+            session["admin_id"] = a["id"]
+            nxt = request.args.get("next", "")
+            return redirect(nxt if nxt.startswith("/admin") else url_for("admin_orders"))
         else:
-            a = db().execute("SELECT * FROM admins WHERE username=?", (user,)).fetchone()
-            if a and check_password_hash(a["pw_hash"], pw):
-                session.clear()
-                session["admin_id"] = a["id"]
-                nxt = request.args.get("next", "")
-                return redirect(nxt if nxt.startswith("/admin") else url_for("admin_orders"))
-            record_fail(key)
             flash("Username atau password salah.", "bad")
     return render_template("admin_login.html")
 
@@ -817,6 +876,18 @@ def admin_photo(name):
         abort(404)
     resp = send_file(path)
     resp.headers["Cache-Control"] = "private, no-store"
+    return resp
+
+
+@app.route("/produk/foto/<name>")
+def product_photo(name):
+    if not re.fullmatch(r"produk_[0-9a-f]{32}\.(jpg|png|webp)", name):
+        abort(404)
+    path = os.path.join(UPLOAD_DIR, name)
+    if not os.path.exists(path):
+        abort(404)
+    resp = send_file(path)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
 
 
@@ -852,13 +923,20 @@ def admin_order(oid):
             flash("Pesanan %s diperbarui: %s." % (o["order_no"], ORDER_STATUS_D[st]), "ok")
         return redirect(url_for("admin_order", oid=oid))
     m = db().execute("SELECT * FROM members WHERE id=?", (o["member_id"],)).fetchone() if o["member_id"] else None
+    delivery_status = o["map_status"] or "unknown"
+    if delivery_status == "unknown" and o["distance_km"] is not None:
+        radius = o["delivery_radius_km"]
+        if radius is None:
+            radius = float(S()["radius_km"])
+        delivery_status = "in" if o["distance_km"] <= float(radius) else "out"
     lines = json.loads(o["items_json"] or "[]")
     msgs = {
         "lunas": "Halo %s, transfer untuk pesanan %s sudah kami terima. Pesanan segera disiapkan. Terima kasih! - Bacus Bandung" % (o["name"], o["order_no"]),
         "dikirim": "Halo %s, pesanan %s sedang diantar ke alamatmu. Siapkan KTP untuk ditunjukkan ke kurir ya. - Bacus Bandung" % (o["name"], o["order_no"]),
     }
     wa_msgs = {k: wa_link(o["wa"], v) for k, v in msgs.items()}
-    return render_template("admin_order.html", o=o, m=m, lines=lines, wa_msgs=wa_msgs,
+    return render_template("admin_order.html", o=o, m=m, lines=lines, delivery_status=delivery_status,
+                           wa_msgs=wa_msgs,
                            wa_chat=wa_link(o["wa"], ""), tab="pesanan")
 
 
@@ -878,22 +956,46 @@ def admin_products():
         f = request.form
         action, pid = f.get("action"), to_int(f.get("id"), -1)
         if action == "hapus":
+            product = db().execute("SELECT image_file FROM products WHERE id=?", (pid,)).fetchone()
+            if not product:
+                abort(404)
             db().execute("DELETE FROM products WHERE id=?", (pid,))
+            db().commit()
+            delete_photo(product["image_file"])
             flash("Produk dihapus.", "ok")
         else:
             vals = product_from_form(f)
             if not vals[0] or vals[5] <= 0:
                 flash("Produk perlu nama dan harga lebih dari 0.", "bad")
                 return redirect(url_for("admin_products", cat=f.get("cat")))
+            upload = request.files.get("foto")
+            new_image = None
+            if upload and upload.filename:
+                new_image, error = save_photo(upload, "produk")
+                if error:
+                    flash(error, "bad")
+                    return redirect(url_for("admin_products", cat=f.get("cat")))
             if action == "tambah":
-                db().execute("INSERT INTO products(name, volume, abv, style, cat, price, promo_price, label, active, sort)"
-                             " VALUES(?,?,?,?,?,?,?,?,?,?)", vals)
+                db().execute("INSERT INTO products(name, volume, abv, style, cat, price, promo_price, label,"
+                             " image_file, active, sort) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                             (*vals[:8], new_image or "", *vals[8:]))
                 flash("Produk %s ditambahkan." % vals[0], "ok")
             else:
+                product = db().execute("SELECT image_file FROM products WHERE id=?", (pid,)).fetchone()
+                if not product:
+                    delete_photo(new_image)
+                    abort(404)
+                old_image = product["image_file"]
+                image_file = new_image or ("" if f.get("hapus_foto") else old_image or "")
                 db().execute("UPDATE products SET name=?, volume=?, abv=?, style=?, cat=?, price=?, promo_price=?,"
-                             " label=?, active=?, sort=? WHERE id=?", (*vals, pid))
+                             " label=?, image_file=?, active=?, sort=? WHERE id=?",
+                             (*vals[:8], image_file, *vals[8:], pid))
                 flash("Produk %s disimpan." % vals[0], "ok")
-        db().commit()
+            if action == "tambah":
+                old_image = None
+            db().commit()
+            if old_image and (new_image or f.get("hapus_foto")):
+                delete_photo(old_image)
         return redirect(url_for("admin_products", cat=request.args.get("cat", "")))
     cat = request.args.get("cat", "")
     sql, args = "SELECT * FROM products", []
@@ -1027,12 +1129,20 @@ def admin_settings():
         if len(wa) < 10:
             flash("Nomor WhatsApp toko belum benar.", "bad")
             return redirect(url_for("admin_settings"))
+        store_lat = to_float(f.get("store_lat"), float("nan"))
+        store_lng = to_float(f.get("store_lng"), float("nan"))
+        radius_km = to_float(f.get("radius_km"), float("nan"))
+        if (not math.isfinite(store_lat) or not -90 <= store_lat <= 90
+                or not math.isfinite(store_lng) or not -180 <= store_lng <= 180
+                or not math.isfinite(radius_km) or radius_km < 0):
+            flash("Koordinat toko atau radius tidak valid. Periksa latitude, longitude, dan radius.", "bad")
+            return redirect(url_for("admin_settings"))
         save_setting("wa", wa)
         for k in ("bank_name", "bank_no", "bank_holder"):
             save_setting(k, f.get(k, "").strip())
-        save_setting("store_lat", to_float(f.get("store_lat"), DEFAULT_SETTINGS["store_lat"]))
-        save_setting("store_lng", to_float(f.get("store_lng"), DEFAULT_SETTINGS["store_lng"]))
-        save_setting("radius_km", _num(max(0.0, to_float(f.get("radius_km"), 10))))
+        save_setting("store_lat", store_lat)
+        save_setting("store_lng", store_lng)
+        save_setting("radius_km", _num(radius_km))
         save_setting("free_min", max(0, to_int(f.get("free_min"))))
         save_setting("member_fee", max(0, to_int(f.get("member_fee"))))
         save_setting("member_disc", _num(min(100.0, max(0.0, to_float(f.get("member_disc"), 5)))))
@@ -1153,6 +1263,8 @@ a{color:inherit}
 .pill[aria-pressed="true"],.pill.on{background:var(--ink);color:var(--bg)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:20px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.product-image{display:block;width:100%;height:190px;object-fit:cover;background:var(--surface)}
+.product-photo-preview img{display:block;width:160px;height:120px;object-fit:cover;border-radius:12px;border:1px solid var(--line)}
 .label{color:var(--lab-ink);padding:14px 16px;display:flex;justify-content:space-between;align-items:flex-end;gap:8px;min-height:104px}
 .lab-a{background:var(--lab-a)} .lab-b{background:var(--lab-b)} .lab-c{background:var(--lab-c)} .lab-d{background:var(--lab-d)} .lab-e{background:var(--lab-e)}
 .label .abv{font-family:var(--display);font-weight:800;font-size:2.4rem;line-height:.9;letter-spacing:-.03em}
@@ -1282,8 +1394,8 @@ T["shop.html"] = r"""{% extends "base.html" %}
   <div class="sec-head"><h2 id="h-cara">Cara order</h2></div>
   <ol class="steps">
     <li><b>Pilih minuman</b><span>Masukkan ke keranjang.</span></li>
-    <li><b>Isi data antar</b><span>Alamat, link peta, dan foto rumah. Member tinggal pakai alamat tersimpan.</span></li>
-    <li><b>Kirim ke WhatsApp</b><span>Pesanan tersimpan, lalu WhatsApp toko terbuka dengan pesan terisi.</span></li>
+    <li><b>Isi data antar</b><span>Lengkapi semua data, bagikan pin rumah dari Google Maps, dan unggah foto rumah.</span></li>
+    <li><b>Kirim ke WhatsApp</b><span>Pesanan tersimpan; tekan Kirim di WhatsApp agar toko menerima notifikasi.</span></li>
     <li><b>Transfer</b><span>Kirim bukti transfer di chat yang sama.</span></li>
     <li><b>Diantar</b><span>Setelah admin memverifikasi transfer.</span></li>
   </ol>
@@ -1298,6 +1410,7 @@ T["shop.html"] = r"""{% extends "base.html" %}
   <div class="grid" id="grid">
     {% for p in products %}
     <article class="card" data-cat="{{ p.cat }}" data-id="{{ p.id }}">
+      {% if p.image_file %}<img class="product-image" src="{{ url_for('product_photo', name=p.image_file) }}" alt="Foto {{ p.name }}" loading="lazy">{% endif %}
       <div class="label lab-{{ p.label }}">
         <span class="abv">{{ ('%g' % p.abv)|replace('.', ',') }}<small>% ABV</small></span><span class="style">{{ p.style }}</span>
       </div>
@@ -1312,7 +1425,7 @@ T["shop.html"] = r"""{% extends "base.html" %}
 
 <section id="checkout" aria-labelledby="h-co">
   <div class="sec-head"><h2 id="h-co">Checkout</h2></div>
-  <form class="two" method="post" action="{{ url_for('checkout') }}" enctype="multipart/form-data" id="co-form" novalidate>
+  <form class="two" method="post" action="{{ url_for('checkout') }}" enctype="multipart/form-data" id="co-form">
     {{ csrf() }}<input type="hidden" name="items" id="items">
     <div class="panel">
       <h3>Pesananmu</h3>
@@ -1334,30 +1447,28 @@ T["shop.html"] = r"""{% extends "base.html" %}
     <div class="panel">
       <h3>Data pengantaran</h3>
       {% if me_member %}<p class="status ok">Member {{ me_member.member_no }}: diskon {{ S.member_disc }}% terpasang dan alamat tersimpan dipakai.</p>{% endif %}
-      <div class="f"><label for="nama">Nama penerima</label><input type="text" name="nama" id="nama" autocomplete="name" value="{{ me_member.name if me_member }}"></div>
-      <div class="f"><label for="wa">Nomor WhatsApp</label><input type="tel" name="wa" id="wa" inputmode="tel" placeholder="08xxxxxxxxxx" autocomplete="tel" value="{{ me_member.wa if me_member }}"></div>
-      <div class="f"><label for="alamat">Alamat lengkap</label><textarea name="alamat" id="alamat" placeholder="Jalan, nomor rumah, RT/RW, kelurahan, kecamatan">{{ me_member.address if me_member }}</textarea></div>
-      <div class="f"><label for="patokan">Patokan <span class="hint">(opsional)</span></label><input type="text" name="patokan" id="patokan" placeholder="Contoh: pagar hitam, sebelah minimarket" value="{{ me_member.landmark if me_member and me_member.landmark }}"></div>
+      <div class="f"><label for="nama">Nama penerima</label><input type="text" name="nama" id="nama" autocomplete="name" value="{{ me_member.name if me_member }}" minlength="2" required></div>
+      <div class="f"><label for="wa">Nomor WhatsApp</label><input type="tel" name="wa" id="wa" inputmode="tel" placeholder="08xxxxxxxxxx" autocomplete="tel" value="{{ me_member.wa if me_member }}" required></div>
+      <div class="f"><label for="alamat">Alamat lengkap</label><textarea name="alamat" id="alamat" placeholder="Jalan, nomor rumah, RT/RW, kelurahan, kecamatan" minlength="15" required>{{ me_member.address if me_member }}</textarea></div>
+      <div class="f"><label for="patokan">Patokan lokasi</label><input type="text" name="patokan" id="patokan" placeholder="Contoh: pagar hitam, sebelah minimarket" value="{{ me_member.landmark if me_member and me_member.landmark }}" minlength="2" required></div>
       <div class="f">
         <label for="peta">Link Google Maps titik rumah</label>
-        <input type="url" name="peta" id="peta" inputmode="url" placeholder="https://maps.app.goo.gl/..." value="{{ me_member.map_url if me_member }}">
+        <input type="url" name="peta" id="peta" inputmode="url" placeholder="https://maps.app.goo.gl/..." value="{{ me_member.map_url if me_member }}" required>
         <span class="hint">Buka Google Maps, tekan lama tepat di rumahmu, pilih Bagikan, lalu tempel link di sini.</span>
         <span class="status" id="peta-status" role="status"></span>
       </div>
-      {% if not me_member %}
       <div class="f">
         <label for="foto">Foto tampak depan rumah</label>
-        <input type="file" name="foto" id="foto" accept="image/jpeg,image/png,image/webp">
-        <span class="hint">Foto disimpan bersama pesanan dan hanya bisa dilihat admin.</span>
+        <input type="file" name="foto" id="foto" accept="image/jpeg,image/png,image/webp" required>
+        <span class="hint">Wajib diunggah setiap order. Foto hanya bisa dilihat admin.</span>
       </div>
-      {% endif %}
-      <label class="check" for="umur"><input type="checkbox" name="umur" id="umur" value="1"><span>Saya berusia 21 tahun ke atas dan siap menunjukkan KTP saat pesanan diterima.</span></label>
+      <label class="check" for="umur"><input type="checkbox" name="umur" id="umur" value="1" required><span>Saya berusia 21 tahun ke atas dan siap menunjukkan KTP saat pesanan diterima.</span></label>
       <button type="submit" class="wa" id="co-btn">Simpan pesanan &amp; lanjut ke WhatsApp</button>
       <span class="hint">Setelah pesanan tersimpan, tombol WhatsApp berisi pesan order muncul di halaman berikutnya.</span>
     </div>
   </form>
 </section>
-<p class="legal">Minuman beralkohol hanya untuk usia 21+. Jangan mengemudi setelah minum. Free ongkir berlaku sampai {{ S.radius_km }} km dari toko{% if S.free_min %} untuk belanja minimal {{ S.free_min|rp }} (dihitung dari subtotal barang sebelum diskon){% endif %}. Di luar ketentuan itu, admin akan mengonfirmasi dulu pengiriman dan ongkirnya.</p>
+<p class="legal">Minuman beralkohol hanya untuk usia 21+. Jangan mengemudi setelah minum. Jarak rumah dibandingkan dengan titik Bacus Bandung menggunakan jarak garis lurus. Free ongkir berlaku sampai {{ S.radius_km }} km{% if S.free_min %} untuk belanja minimal {{ S.free_min|rp }} (dihitung dari subtotal barang sebelum diskon){% endif %}. Pesanan di luar radius tetap diterima, tetapi ongkir harus dikonfirmasi admin sebelum pembayaran.</p>
 {% endblock %}
 {% block after %}
 <div class="bar"><div class="in">
@@ -1458,6 +1569,9 @@ T["order.html"] = r"""{% extends "base.html" %}
       {% if o.member_disc %}<div class="disc"><span>Diskon member</span><span>− {{ o.member_disc|rp }}</span></div>{% endif %}
       {% if o.promo_disc %}<div class="disc"><span>Kode {{ o.promo_code }}</span><span>− {{ o.promo_disc|rp }}</span></div>{% endif %}
       <div><span>Ongkir</span><span>{{ 'GRATIS' if o.free_ship else 'Dicek admin' }}</span></div>
+      <div><span>Jarak dari toko</span><span>{{ o.distance_km|km }} km ·
+        {% if delivery_status == 'out' %}di luar radius {{ o.delivery_radius_km|km }} km, ongkir menunggu konfirmasi
+        {% else %}dalam radius toko{% endif %}</span></div>
       <div class="grand"><span>Total transfer</span><span>{{ o.total|rp }}{{ '' if o.free_ship else ' + ongkir' }}</span></div>
     </div>
   </div>
@@ -1468,7 +1582,8 @@ T["order.html"] = r"""{% extends "base.html" %}
       <li>{% if o.free_ship %}Transfer <b>{{ o.total|rp }}</b>{% else %}Tunggu admin mengonfirmasi ongkir, lalu transfer totalnya{% endif %} ke rekening di bawah.</li>
       <li>Kirim foto bukti transfer di chat yang sama. Pesanan diantar setelah admin memverifikasi transfer.</li>
     </ol>
-    <a class="wa" href="{{ wa }}" target="_blank" rel="noopener">Kirim order ke WhatsApp</a>
+    <a class="wa" href="{{ wa }}" target="_blank" rel="noopener">Kirim notifikasi order ke admin ({{ admin_whatsapp() }})</a>
+    <p class="hint">WhatsApp akan terbuka ke nomor admin dengan detail order terisi. Tekan tombol Kirim di WhatsApp agar notifikasi benar-benar diterima.</p>
     <div class="box">
       <span class="hint">Rekening toko</span>
       <span><b>{{ S.bank_name }}</b> · a.n. {{ S.bank_holder }}</span>
@@ -1555,7 +1670,7 @@ T["member_registered.html"] = r"""{% extends "base.html" %}
     <li>Tekan tombol di bawah dan kirim bukti transfer di chat WhatsApp.</li>
     <li>Setelah admin memverifikasi, kamu bisa masuk di menu Member dengan nomor WhatsApp dan PIN.</li>
   </ol>
-  <a class="wa" href="{{ wa }}" target="_blank" rel="noopener">Kirim konfirmasi ke WhatsApp</a>
+  <a class="wa" href="{{ wa }}" target="_blank" rel="noopener">Kirim konfirmasi ke WhatsApp admin ({{ admin_whatsapp() }})</a>
 </div>
 {% endblock %}"""
 
@@ -1674,7 +1789,10 @@ T["admin_order.html"] = r"""{% extends "admin_base.html" %}
       <dt>Alamat</dt><dd>{{ o.address }}</dd>
       {% if o.landmark %}<dt>Patokan</dt><dd>{{ o.landmark }}</dd>{% endif %}
       <dt>Peta</dt><dd><a href="{{ o.map_url }}" target="_blank" rel="noopener noreferrer">Buka Google Maps</a></dd>
-      <dt>Jarak</dt><dd>{{ o.distance_km|km }} km (garis lurus)</dd>
+      <dt>Jarak</dt><dd>{{ o.distance_km|km }} km (garis lurus) ·
+        {% if delivery_status == 'out' %}<b>Di luar radius, ongkir perlu konfirmasi</b>
+        {% elif delivery_status == 'in' %}Dalam radius toko
+        {% else %}Lokasi belum terverifikasi{% endif %}</dd>
     </dl>
     <div class="photos">
       {% set house = o.house_file or (m.house_file if m) %}
@@ -1691,6 +1809,9 @@ T["admin_order.html"] = r"""{% extends "admin_base.html" %}
 T["admin_products.html"] = r"""{% extends "admin_base.html" %}
 {% macro fields(p) %}
   <label class="af wide">Nama produk<input type="text" name="name" value="{{ p.name if p }}" required></label>
+  {% if p and p.image_file %}<div class="product-photo-preview wide"><img src="{{ url_for('product_photo', name=p.image_file) }}" alt="Foto {{ p.name }}"></div>{% endif %}
+  <label class="af wide">Foto produk (JPG, PNG, atau WEBP; maks. 10 MB)<input type="file" name="foto" accept="image/jpeg,image/png,image/webp"></label>
+  {% if p and p.image_file %}<label class="af chk"><input type="checkbox" name="hapus_foto" value="1">Hapus foto saat disimpan</label>{% endif %}
   <label class="af">Kemasan<input type="text" name="volume" value="{{ p.volume if p }}" placeholder="330 ml · botol"></label>
   <label class="af">Jenis<input type="text" name="style" value="{{ p.style if p }}" placeholder="Lager"></label>
   <label class="af">ABV %<input type="number" step="0.1" min="0" name="abv" value="{{ ('%g' % p.abv) if p else '' }}"></label>
@@ -1707,10 +1828,10 @@ T["admin_products.html"] = r"""{% extends "admin_base.html" %}
   {% for k, l in CATS %}<a class="pill {{ 'on' if cat == k }}" href="{{ url_for('admin_products', cat=k) }}">{{ l }}</a>{% endfor %}
 </div>
 <details class="panel"><summary><b>Tambah produk baru</b></summary>
-  <form method="post" class="arow" style="border:0;padding:0;margin-top:12px">{{ csrf() }}<input type="hidden" name="action" value="tambah">{{ fields(None) }}<button class="solid" type="submit">Tambah</button></form>
+  <form method="post" enctype="multipart/form-data" class="arow" style="border:0;padding:0;margin-top:12px">{{ csrf() }}<input type="hidden" name="action" value="tambah">{{ fields(None) }}<button class="solid" type="submit">Tambah</button></form>
 </details>
 {% for p in rows %}
-<form method="post" class="arow">
+<form method="post" enctype="multipart/form-data" class="arow">
   {{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}">
   {{ fields(p) }}
   <div class="inline"><button class="mini" type="submit" name="action" value="simpan">Simpan</button>
@@ -1818,17 +1939,20 @@ T["admin_settings.html"] = r"""{% extends "admin_base.html" %}
 {% block admin %}
 <form method="post" class="stack">{{ csrf() }}
   <div class="panel"><h3>WhatsApp dan rekening</h3><div class="arow" style="border:0;padding:0">
-    <label class="af wide">Nomor WhatsApp toko<input type="tel" name="wa" value="{{ S.wa }}"></label>
+    <label class="af wide">Nomor WhatsApp admin penerima notifikasi<input type="tel" name="wa" value="{{ admin_whatsapp() }}"></label>
+    <p class="hint wide">Default: 08974109148. Format lokal 08... atau internasional 62... diterima. Jika BACUS_ADMIN_WA diatur di Railway, nomor tersebut menjadi penerima dan mengesampingkan isian ini.</p>
     <label class="af">Bank<input type="text" name="bank_name" value="{{ S.bank_name }}"></label>
     <label class="af">Nomor rekening<input type="text" name="bank_no" value="{{ S.bank_no }}"></label>
     <label class="af">Atas nama<input type="text" name="bank_holder" value="{{ S.bank_holder }}"></label>
   </div></div>
-  <div class="panel"><h3>Free ongkir</h3><div class="arow" style="border:0;padding:0">
+  <div class="panel"><h3>Lokasi toko dan free ongkir</h3>
+    <p class="hint">Bacus Bandung · Jl. Khp Hasan Mustopa, Padasuka, Kec. Cibeunying Kidul, Kota Bandung, Jawa Barat 40125 · <a href="https://maps.app.goo.gl/mWTbxSwqTx8SJH3LA" target="_blank" rel="noopener noreferrer">Buka titik toko di Google Maps</a></p>
+    <div class="arow" style="border:0;padding:0">
     <label class="af">Radius (km)<input type="number" step="0.5" min="0" name="radius_km" value="{{ S.radius_km }}"></label>
     <label class="af">Minimal belanja (Rp)<input type="number" step="1000" min="0" name="free_min" value="{{ S.free_min }}"></label>
     <label class="af">Latitude toko<input type="text" name="store_lat" value="{{ S.store_lat }}"></label>
     <label class="af">Longitude toko<input type="text" name="store_lng" value="{{ S.store_lng }}"></label>
-  </div><p class="hint">Jarak dihitung garis lurus dari titik toko. Minimal belanja dihitung dari subtotal barang sebelum diskon.</p></div>
+  </div><p class="hint">Koordinat awal: -6.902017, 107.652076 (dari link Google Maps Bacus). Jarak ke pin rumah dihitung garis lurus, bukan jarak jalan. Pesanan di luar radius tetap masuk tetapi ongkir harus dikonfirmasi admin. Minimal free ongkir dihitung dari subtotal barang sebelum diskon.</p></div>
   <div class="panel"><h3>Member</h3><div class="arow" style="border:0;padding:0">
     <label class="af">Diskon member (%)<input type="number" step="0.5" min="0" max="100" name="member_disc" value="{{ S.member_disc }}"></label>
     <label class="af">Biaya daftar seumur hidup (Rp)<input type="number" step="1000" min="0" name="member_fee" value="{{ S.member_fee }}"></label>
@@ -1879,4 +2003,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     print(" Toko:        http://localhost:%d" % port)
     print(" Back office: http://localhost:%d/admin" % port, flush=True)
-    app.run(host=os.environ.get("HOST", "0.0.0.0"), port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
