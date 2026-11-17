@@ -851,10 +851,6 @@ def checkout():
             flash(error, "bad")
         return redirect(url_for("shop") + "#checkout")
     house = None
-    house, err = save_photo(request.files.get("foto"), "rumah")
-    if err:
-        flash("Unggah foto tampak depan rumah." if err == "missing" else err, "bad")
-        return redirect(url_for("shop") + "#checkout")
     for _ in range(5):
         order_no = "BCS-%s-%04d" % (local_now().strftime("%y%m%d"), secrets.randbelow(10000))
         if not db().execute("SELECT 1 FROM orders WHERE order_no=?", (order_no,)).fetchone():
@@ -868,7 +864,7 @@ def checkout():
          c["dist"], c["map_status"], S()["radius_km"], house, json.dumps(c["lines"]), c["sub"],
          c["promo_code"], c["promo_disc"], 1 if c["free"] else 0, c["total"], c["ship_fee"], c["ship_km"]))
     db().commit()
-    return redirect(url_for("order_page", order_no=order_no, k=token))
+    return redirect(url_for("order_page", order_no=order_no, k=token, go=1))
 
 
 def order_message(o, lines):
@@ -903,7 +899,6 @@ def order_message(o, lines):
     out += ["", "*Pengantaran*", "Nama: " + o["name"], "WhatsApp: " + o["wa"],
             "Alamat: " + o["address"], "Patokan: " + o["landmark"]]
     out += ["Pin rumah: " + o["map_url"], "Titik toko: https://maps.app.goo.gl/mWTbxSwqTx8SJH3LA", "",
-            "*Foto tampak depan rumah:* terlampir di chat ini. Jika belum ada, minta pelanggan mengirim fotonya sebelum pesanan diproses.",
             "Pembayaran: transfer bank. Bukti transfer saya kirim di chat ini.",
             "Saya berusia 21 tahun ke atas."]
     return "\n".join(out)
@@ -1498,7 +1493,7 @@ T["shop.html"] = r"""{% extends "base.html" %}
 
 <section id="checkout" aria-labelledby="h-co">
   <div class="sec-head"><h2 id="h-co">Checkout</h2></div>
-  <form class="two" method="post" action="{{ url_for('checkout') }}" enctype="multipart/form-data" id="co-form">
+  <form class="two" method="post" action="{{ url_for('checkout') }}" id="co-form">
     {{ csrf() }}<input type="hidden" name="items" id="items">
     <div class="panel">
       <h3>Pesananmu</h3>
@@ -1528,14 +1523,9 @@ T["shop.html"] = r"""{% extends "base.html" %}
         <span class="hint">Buka Google Maps, tekan lama tepat di rumahmu, pilih Bagikan, lalu tempel link di sini.</span>
         <span class="status" id="peta-status" role="status"></span>
       </div>
-      <div class="f">
-        <label for="foto">Foto tampak depan rumah</label>
-        <input type="file" name="foto" id="foto" accept="image/jpeg,image/png,image/webp" required>
-        <span class="hint">Wajib diunggah setiap order. Foto ikut dikirim ke WhatsApp admin dari halaman berikutnya.</span>
-      </div>
       <label class="check" for="umur"><input type="checkbox" name="umur" id="umur" value="1" required><span>Saya berusia 21 tahun ke atas dan siap menunjukkan KTP saat pesanan diterima.</span></label>
       <button type="submit" class="wa" id="co-btn" {{ '' if store_open else 'disabled' }}>{{ 'Simpan pesanan &amp; lanjut ke WhatsApp'|safe if store_open else 'Toko tutup' }}</button>
-      <span class="hint">Setelah pesanan tersimpan, tombol WhatsApp berisi pesan order muncul di halaman berikutnya.</span>
+      <span class="hint">Setelah pesanan tersimpan, WhatsApp admin terbuka otomatis dengan detail order terisi. Tekan Kirim di sana.</span>
     </div>
   </form>
 </section>
@@ -1646,22 +1636,11 @@ T["order.html"] = r"""{% extends "base.html" %}
   <div class="panel">
     <h3>Langkah berikutnya</h3>
     <ol class="stack" style="margin:0;padding-left:20px">
-      <li>{% if o.house_file %}Tekan <b>Kirim pesanan + foto rumah</b>. Di HP, pilih WhatsApp lalu chat admin dan tekan kirim; foto rumah ikut terlampir.{% else %}Tekan tombol hijau di bawah, lalu tekan kirim di WhatsApp.{% endif %}</li>
+      <li>WhatsApp admin terbuka otomatis dengan detail pesananmu. Kalau tidak terbuka, tekan tombol hijau di bawah, lalu tekan Kirim di WhatsApp.</li>
       <li>{% if o.free_ship %}Transfer <b>{{ o.total|rp }}</b>{% elif o.ship_fee %}Transfer <b>{{ (o.total + o.ship_fee)|rp }}</b> (barang + ongkir){% else %}Tunggu admin mengonfirmasi ongkir, lalu transfer totalnya{% endif %} ke rekening di bawah.</li>
       <li>Kirim foto bukti transfer di chat yang sama. Pesanan diantar setelah admin memverifikasi transfer.</li>
     </ol>
-    {% if o.house_file %}
-    <a class="wa" id="wa-link" href="{{ wa }}" target="_blank" rel="noopener" data-msg="{{ msg }}" data-photo="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" data-name="foto-rumah-{{ o.order_no }}.jpg">Kirim pesanan + foto rumah ke WhatsApp</a>
-    {% else %}
-    <a class="wa" id="wa-link" href="{{ wa }}" target="_blank" rel="noopener">Kirim pesanan ke WhatsApp</a>
-    {% endif %}
-    {% if o.house_file %}
-    <div class="stack" id="photo-fallback">
-      <p class="hint">Di komputer, foto tidak bisa terlampir otomatis. Setelah WhatsApp terbuka, lampirkan foto rumahmu secara manual:</p>
-      <img src="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" alt="Foto rumah yang kamu unggah" style="max-width:220px;border-radius:12px;border:1px solid var(--line)">
-      <a class="mini" href="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" download="foto-rumah-{{ o.order_no }}.jpg">Simpan foto rumah</a>
-    </div>
-    {% endif %}
+    <a class="wa" id="wa-link" href="{{ wa }}" target="_blank" rel="noopener">Kirim pesanan ke WhatsApp admin ({{ admin_whatsapp() }})</a>
     <p class="hint">Tekan Kirim di WhatsApp agar admin benar-benar menerima pesananmu. Pengiriman otomatis tanpa menekan Kirim tidak bisa dilakukan oleh website.</p>
     <div class="box">
       <span class="hint">Rekening toko</span>
@@ -1676,22 +1655,12 @@ T["order.html"] = r"""{% extends "base.html" %}
 <script nonce="{{ nonce() }}">
 try { localStorage.removeItem("bacus-cart"); } catch (e) {}
 (function () {
+  // Setelah pesanan baru disimpan, langsung buka WhatsApp admin (sekali saja per pesanan).
   const btn = document.getElementById("wa-link");
-  if (!btn || !btn.dataset.photo || !navigator.share || !navigator.canShare) return;
-  let file = null;
-  fetch(btn.dataset.photo, {credentials: "same-origin"}).then(r => r.ok ? r.blob() : null).then(b => {
-    if (!b) return;
-    const f = new File([b], btn.dataset.name, {type: b.type || "image/jpeg"});
-    if (navigator.canShare({files: [f]})) file = f;
-  }).catch(() => {});
-  btn.addEventListener("click", e => {
-    if (!file) return;               // belum siap / tidak didukung: pakai link wa.me biasa
-    e.preventDefault();
-    navigator.share({files: [file], text: btn.dataset.msg}).catch(err => {
-      if (err && err.name === "AbortError") return;   // pembeli menutup menu bagikan
-      window.open(btn.href, "_blank", "noopener");
-    });
-  });
+  if (!btn || new URLSearchParams(location.search).get("go") !== "1") return;
+  const key = "bacus-wa-" + location.pathname;
+  try { if (sessionStorage.getItem(key)) return; sessionStorage.setItem(key, "1"); } catch (e) {}
+  location.href = btn.href;
 })();
 document.addEventListener("click", e => {
   const t = e.target.closest("[data-copy]"); if (!t) return;
@@ -1794,7 +1763,7 @@ T["admin_order.html"] = r"""{% extends "admin_base.html" %}
     </dl>
     <div class="photos">
       {% set house = o.house_file %}
-      {% if house %}<a href="{{ url_for('admin_photo', name=house) }}" target="_blank"><img src="{{ url_for('admin_photo', name=house) }}" alt="Foto rumah pembeli">Foto rumah</a>{% else %}<p class="empty">Tidak ada foto rumah.</p>{% endif %}
+      {% if house %}<a href="{{ url_for('admin_photo', name=house) }}" target="_blank"><img src="{{ url_for('admin_photo', name=house) }}" alt="Foto rumah pembeli">Foto rumah</a>{% endif %}
     </div>
     <h3>Kabari pembeli</h3>
     <a class="wa" href="{{ wa_msgs.lunas }}" target="_blank" rel="noopener">Transfer diterima</a>
