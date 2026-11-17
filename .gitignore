@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+bacus_data/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.secret_key
+foto/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
