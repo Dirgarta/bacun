@@ -1646,18 +1646,18 @@ T["order.html"] = r"""{% extends "base.html" %}
   <div class="panel">
     <h3>Langkah berikutnya</h3>
     <ol class="stack" style="margin:0;padding-left:20px">
-      <li>{% if o.house_file %}Tekan <b>Kirim pesanan + foto rumah</b>, pilih WhatsApp, lalu pilih chat admin dan tekan kirim. Foto rumah ikut terlampir.{% else %}Tekan tombol hijau di bawah, lalu tekan kirim di WhatsApp.{% endif %}</li>
+      <li>{% if o.house_file %}Tekan <b>Kirim pesanan + foto rumah</b>. Di HP, pilih WhatsApp lalu chat admin dan tekan kirim; foto rumah ikut terlampir.{% else %}Tekan tombol hijau di bawah, lalu tekan kirim di WhatsApp.{% endif %}</li>
       <li>{% if o.free_ship %}Transfer <b>{{ o.total|rp }}</b>{% elif o.ship_fee %}Transfer <b>{{ (o.total + o.ship_fee)|rp }}</b> (barang + ongkir){% else %}Tunggu admin mengonfirmasi ongkir, lalu transfer totalnya{% endif %} ke rekening di bawah.</li>
       <li>Kirim foto bukti transfer di chat yang sama. Pesanan diantar setelah admin memverifikasi transfer.</li>
     </ol>
     {% if o.house_file %}
-    <button type="button" class="wa" id="share-btn" data-msg="{{ msg }}" data-photo="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" data-name="foto-rumah-{{ o.order_no }}.jpg" hidden>Kirim pesanan + foto rumah ke WhatsApp</button>
-    <p class="hint" id="share-hint" hidden>WhatsApp terbuka dengan foto dan detail order terlampir. Pilih chat admin ({{ admin_whatsapp() }}), lalu tekan Kirim.</p>
+    <a class="wa" id="wa-link" href="{{ wa }}" target="_blank" rel="noopener" data-msg="{{ msg }}" data-photo="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" data-name="foto-rumah-{{ o.order_no }}.jpg">Kirim pesanan + foto rumah ke WhatsApp</a>
+    {% else %}
+    <a class="wa" id="wa-link" href="{{ wa }}" target="_blank" rel="noopener">Kirim pesanan ke WhatsApp</a>
     {% endif %}
-    <a class="wa" id="wa-link" href="{{ wa }}" target="_blank" rel="noopener">Kirim detail order ke admin ({{ admin_whatsapp() }})</a>
     {% if o.house_file %}
     <div class="stack" id="photo-fallback">
-      <p class="hint">Kalau tombol di atas tidak muncul (misalnya di komputer), kirim detail order lewat tombol hijau, lalu lampirkan foto rumahmu di chat itu secara manual:</p>
+      <p class="hint">Di komputer, foto tidak bisa terlampir otomatis. Setelah WhatsApp terbuka, lampirkan foto rumahmu secara manual:</p>
       <img src="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" alt="Foto rumah yang kamu unggah" style="max-width:220px;border-radius:12px;border:1px solid var(--line)">
       <a class="mini" href="{{ url_for('order_photo', order_no=o.order_no, k=o.token) }}" download="foto-rumah-{{ o.order_no }}.jpg">Simpan foto rumah</a>
     </div>
@@ -1676,20 +1676,21 @@ T["order.html"] = r"""{% extends "base.html" %}
 <script nonce="{{ nonce() }}">
 try { localStorage.removeItem("bacus-cart"); } catch (e) {}
 (function () {
-  const btn = document.getElementById("share-btn");
-  if (!btn || !navigator.share || !navigator.canShare) return;
+  const btn = document.getElementById("wa-link");
+  if (!btn || !btn.dataset.photo || !navigator.share || !navigator.canShare) return;
   let file = null;
   fetch(btn.dataset.photo, {credentials: "same-origin"}).then(r => r.ok ? r.blob() : null).then(b => {
     if (!b) return;
     const f = new File([b], btn.dataset.name, {type: b.type || "image/jpeg"});
-    if (!navigator.canShare({files: [f]})) return;
-    file = f;
-    btn.hidden = false;
-    document.getElementById("share-hint").hidden = false;
+    if (navigator.canShare({files: [f]})) file = f;
   }).catch(() => {});
-  btn.addEventListener("click", () => {
-    if (!file) return;
-    navigator.share({files: [file], text: btn.dataset.msg}).catch(() => {});
+  btn.addEventListener("click", e => {
+    if (!file) return;               // belum siap / tidak didukung: pakai link wa.me biasa
+    e.preventDefault();
+    navigator.share({files: [file], text: btn.dataset.msg}).catch(err => {
+      if (err && err.name === "AbortError") return;   // pembeli menutup menu bagikan
+      window.open(btn.href, "_blank", "noopener");
+    });
   });
 })();
 document.addEventListener("click", e => {
